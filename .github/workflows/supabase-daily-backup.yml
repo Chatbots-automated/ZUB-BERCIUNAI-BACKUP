@@ -1,0 +1,110 @@
+name: Supabase Daily Backup (DB + Storage, keep 4 days)
+
+on:
+  schedule:
+    # Runs daily at 01:00 UTC (≈03:00 Vilnius in winter, 04:00 in summer)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (for scripts)
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client & zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client zip
+
+      - name: Set date variables
+        id: dt
+        run: |
+          echo "DATE=$(date -u +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+          echo "DAY=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      # ============= DB DUMP =============
+      - name: Test DB connection
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: psql "$DB_URL" -Atc "select now(), current_database();"
+
+      - name: Dump database (custom compressed format)
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          mkdir -p backup/${{ steps.dt.outputs.DATE }}
+          pg_dump --dbname="$DB_URL" \
+                  --format=custom \
+                  --no-owner --no-privileges \
+                  --file=backup/${{ steps.dt.outputs.DATE }}/db.dump
+
+      # ============= STORAGE DUMP =============
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install storage deps
+        run: npm i @supabase/supabase-js
+
+      - name: Download all Storage buckets/files
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+        run: |
+          node scripts/storage-backup.mjs backup/${{ steps.dt.outputs.DATE }}/storage
+          cd backup/${{ steps.dt.outputs.DATE }}
+          zip -r storage.zip storage
+          rm -rf storage
+
+      - name: Checksums
+        run: |
+          cd backup/${{ steps.dt.outputs.DATE }}
+          sha256sum db.dump storage.zip > SHA256SUMS.txt
+
+      - name: Upload artifact (auto-delete after 4 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ steps.dt.outputs.DATE }}
+          path: backup/${{ steps.dt.outputs.DATE }}/*
+          retention-days: 4
+
+  prune:
+    needs: backup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old artifacts, keep latest 4
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const perPage = 100;
+            let page = 1, all = [];
+            while (true) {
+              const { data } = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: perPage,
+                page
+              });
+              all = all.concat(data.artifacts || []);
+              if (data.artifacts.length < perPage) break;
+              page++;
+            }
+            const backups = all
+              .filter(a => a.name.startsWith('supabase-backup-'))
+              .sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = backups.slice(4); // keep 4 newest
+            for (const art of toDelete) {
+              core.info(`Deleting ${art.name} (${art.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: art.id
+              });
+            }
