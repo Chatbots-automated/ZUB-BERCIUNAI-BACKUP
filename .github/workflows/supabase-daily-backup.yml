@@ -2,8 +2,7 @@ name: Supabase Daily Backup (DB + Storage, keep 4 days)
 
 on:
   schedule:
-    # Runs daily at 01:00 UTC (≈03:00 Vilnius in winter, 04:00 in summer)
-    - cron: '0 1 * * *'
+    - cron: '0 1 * * *'   # daily at 01:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -17,10 +16,35 @@ jobs:
       - name: Checkout repo (for scripts)
         uses: actions/checkout@v4
 
-      - name: Install PostgreSQL client & zip
+      - name: Install tooling (psql, zip, dig, nc)
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client zip
+          sudo apt-get install -y postgresql-client zip dnsutils netcat-traditional
+
+      - name: Force IPv4 for Supabase DB hostname
+        id: ipv4
+        env:
+          DB_HOST: db.olxnahsxvyiadknybagt.supabase.co
+        run: |
+          set -e
+          # Resolve IPv4 (A) record; fallback to getent if dig fails
+          IPV4=$(dig +short A "$DB_HOST" | head -n1)
+          if [ -z "$IPV4" ]; then
+            IPV4=$(getent ahostsv4 "$DB_HOST" | awk '{print $1; exit}')
+          fi
+          if [ -z "$IPV4" ]; then
+            echo "Could not resolve IPv4 for $DB_HOST"
+            exit 1
+          fi
+          echo "Resolved $DB_HOST -> $IPV4"
+          echo "$IPV4 $DB_HOST" | sudo tee -a /etc/hosts
+          echo "ip=$IPV4" >> $GITHUB_OUTPUT
+
+      - name: Connectivity sanity check (IPv4 5432)
+        env:
+          DB_HOST: db.olxnahsxvyiadknybagt.supabase.co
+        run: |
+          nc -vz "$DB_HOST" 5432 || (echo "Port 5432 not reachable over IPv4" && exit 2)
 
       - name: Set date variables
         id: dt
@@ -29,7 +53,7 @@ jobs:
           echo "DAY=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
       # ============= DB DUMP =============
-      - name: Test DB connection
+      - name: Test DB connection (IPv4 pinned)
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: psql "$DB_URL" -Atc "select now(), current_database();"
@@ -55,7 +79,7 @@ jobs:
 
       - name: Download all Storage buckets/files
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: https://olxnahsxvyiadknybagt.supabase.co
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
         run: |
           node scripts/storage-backup.mjs backup/${{ steps.dt.outputs.DATE }}/storage
@@ -99,7 +123,7 @@ jobs:
             const backups = all
               .filter(a => a.name.startsWith('supabase-backup-'))
               .sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-            const toDelete = backups.slice(4); // keep 4 newest
+            const toDelete = backups.slice(4);
             for (const art of toDelete) {
               core.info(`Deleting ${art.name} (${art.id})`);
               await github.rest.actions.deleteArtifact({
